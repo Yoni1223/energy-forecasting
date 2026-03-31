@@ -726,6 +726,9 @@ elif page == "🌍 Live European Grid":
         # ── Step 3: Merge and predict ─────────────────────────────────────
         with st.spinner("Merging data and generating predictions..."):
 
+            # Round both timestamps to nearest hour to avoid merge key mismatch
+            load_df['time']    = pd.to_datetime(load_df['time']).dt.floor('h')
+            weather_df['time'] = pd.to_datetime(weather_df['time']).dt.floor('h')
             merged = pd.merge(load_df, weather_df, on='time', how='inner')
             merged = merged.sort_values('time').reset_index(drop=True)
 
