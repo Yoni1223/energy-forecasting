@@ -239,6 +239,7 @@ with st.sidebar:
         "🔮 Single Hour Prediction",
         "📅 Date Range Forecast",
         "📤 Upload Your Own Data",
+        "🌍 Live European Grid",
         "📊 Model Dashboard",
         "📈 Results & Charts"
     ], label_visibility="collapsed")
@@ -578,3 +579,234 @@ elif page == "📈 Results & Charts":
         st.divider()
     if not available:
         st.info("No chart PNG files found.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 6 — LIVE EUROPEAN GRID DATA
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "🌍 Live European Grid":
+    import requests
+    from xml.etree import ElementTree as ET
+
+    st.title("🌍 Live European Grid Forecast")
+    st.markdown("Fetch real electricity demand and weather data for any European country and run the model on it.")
+    st.divider()
+
+    # Country options with ENTSO-E domain codes
+    COUNTRIES = {
+        "Portugal": "10YPT-REN------W",
+        "Spain":    "10YES-REE------0",
+        "France":   "10YFR-RTE------C",
+        "Germany":  "10Y1001A1001A83F",
+        "Italy":    "10YIT-GRTN-----B",
+        "Netherlands": "10YNL----------L",
+        "Belgium":  "10YBE----------2",
+        "Poland":   "10YPL-AREA-----S",
+    }
+
+    CITY_COORDS = {
+        "Portugal":    (38.7, -9.1),
+        "Spain":       (40.4, -3.7),
+        "France":      (48.9, 2.3),
+        "Germany":     (52.5, 13.4),
+        "Italy":       (41.9, 12.5),
+        "Netherlands": (52.4, 4.9),
+        "Belgium":     (50.8, 4.4),
+        "Poland":      (52.2, 21.0),
+    }
+
+    ENTSO_API_KEY = "335b12c9-dea9-483f-8bb1-62896a6def14"
+
+    col1, col2 = st.columns(2)
+    with col1:
+        country = st.selectbox("Select Country", list(COUNTRIES.keys()))
+    with col2:
+        n_days = st.slider("Number of days to fetch", 1, 14, 3)
+
+    from datetime import timedelta
+    end_dt   = datetime.utcnow().replace(minute=0, second=0, microsecond=0)
+    start_dt = end_dt - timedelta(days=n_days)
+
+    if st.button("🔄 Fetch Live Data & Predict", use_container_width=True, type="primary"):
+
+        domain  = COUNTRIES[country]
+        lat, lon = CITY_COORDS[country]
+
+        # ── Step 1: Fetch load from ENTSO-E ──────────────────────────────
+        with st.spinner(f"Fetching {country} grid data from ENTSO-E..."):
+            try:
+                period_start = start_dt.strftime('%Y%m%d%H%M')
+                period_end   = end_dt.strftime('%Y%m%d%H%M')
+
+                url = (
+                    f"https://web-api.tp.entsoe.eu/api"
+                    f"?documentType=A65"
+                    f"&processType=A16"
+                    f"&outBiddingZone_Domain={domain}"
+                    f"&periodStart={period_start}"
+                    f"&periodEnd={period_end}"
+                    f"&securityToken={ENTSO_API_KEY}"
+                )
+
+                resp = requests.get(url, timeout=30)
+
+                if resp.status_code == 200:
+                    root = ET.fromstring(resp.content)
+                    ns   = {'ns': 'urn:iec62325.351:tc57wg16:451-6:generationloaddocument:3:0'}
+
+                    times, loads = [], []
+                    for ts in root.findall('.//ns:TimeSeries', ns):
+                        period = ts.find('ns:Period', ns)
+                        if period is None:
+                            continue
+                        start_str = period.find('ns:timeInterval/ns:start', ns).text
+                        start_ts  = pd.to_datetime(start_str)
+                        for pt in period.findall('ns:Point', ns):
+                            pos  = int(pt.find('ns:position', ns).text)
+                            qty  = pt.find('ns:quantity', ns)
+                            if qty is not None:
+                                times.append(start_ts + pd.Timedelta(hours=pos-1))
+                                loads.append(float(qty.text))
+
+                    if not times:
+                        st.error("No load data returned. The ENTSO-E API may not have data for this period yet.")
+                        st.stop()
+
+                    load_df = pd.DataFrame({'time': times, 'total_load_actual': loads})
+                    load_df = load_df.sort_values('time').drop_duplicates('time').reset_index(drop=True)
+                    st.success(f"✅ Loaded {len(load_df):,} hours of {country} grid data")
+
+                elif resp.status_code == 401:
+                    st.error("API key unauthorised. Please check your ENTSO-E security token.")
+                    st.stop()
+                elif resp.status_code == 400:
+                    st.error(f"Bad request — the API returned: {resp.text[:300]}")
+                    st.stop()
+                else:
+                    st.error(f"ENTSO-E API error {resp.status_code}: {resp.text[:200]}")
+                    st.stop()
+
+            except requests.exceptions.Timeout:
+                st.error("Request timed out. ENTSO-E API may be slow — try a shorter date range.")
+                st.stop()
+            except Exception as e:
+                st.error(f"Error fetching grid data: {e}")
+                st.stop()
+
+        # ── Step 2: Fetch weather from Open-Meteo ────────────────────────
+        with st.spinner(f"Fetching weather data for {country}..."):
+            try:
+                weather_url = (
+                    f"https://archive-api.open-meteo.com/v1/archive"
+                    f"?latitude={lat}&longitude={lon}"
+                    f"&start_date={start_dt.strftime('%Y-%m-%d')}"
+                    f"&end_date={end_dt.strftime('%Y-%m-%d')}"
+                    f"&hourly=temperature_2m,relative_humidity_2m,wind_speed_10m"
+                    f"&timezone=UTC"
+                )
+
+                wresp = requests.get(weather_url, timeout=30)
+
+                if wresp.status_code == 200:
+                    wdata = wresp.json()
+                    weather_df = pd.DataFrame({
+                        'time':       pd.to_datetime(wdata['hourly']['time']),
+                        'temp_c':     wdata['hourly']['temperature_2m'],
+                        'humidity':   wdata['hourly']['relative_humidity_2m'],
+                        'wind_speed': wdata['hourly']['wind_speed_10m'],
+                    })
+                    st.success(f"✅ Loaded weather data ({len(weather_df):,} hours)")
+                else:
+                    st.error(f"Weather API error: {wresp.status_code}")
+                    st.stop()
+
+            except Exception as e:
+                st.error(f"Error fetching weather: {e}")
+                st.stop()
+
+        # ── Step 3: Merge and predict ─────────────────────────────────────
+        with st.spinner("Merging data and generating predictions..."):
+
+            merged = pd.merge(load_df, weather_df, on='time', how='inner')
+            merged = merged.sort_values('time').reset_index(drop=True)
+
+            if len(merged) == 0:
+                st.error("No overlapping data between grid and weather. Try a different date range.")
+                st.stop()
+
+            # Add features
+            merged['hour']      = merged['time'].dt.hour
+            merged['dayofweek'] = merged['time'].dt.dayofweek
+            merged['month']     = merged['time'].dt.month
+            merged['is_weekend']= (merged['dayofweek'] >= 5).astype(int)
+            merged['hour_sin']  = np.sin(2*np.pi*merged['hour']/24)
+            merged['hour_cos']  = np.cos(2*np.pi*merged['hour']/24)
+            merged['month_sin'] = np.sin(2*np.pi*merged['month']/12)
+            merged['month_cos'] = np.cos(2*np.pi*merged['month']/12)
+            merged['dow_sin']   = np.sin(2*np.pi*merged['dayofweek']/7)
+            merged['dow_cos']   = np.cos(2*np.pi*merged['dayofweek']/7)
+
+            merged['load_lag_1h']           = merged['total_load_actual'].shift(1)
+            merged['load_lag_24h']          = merged['total_load_actual'].shift(24)
+            merged['load_lag_168h']         = merged['total_load_actual'].shift(168)
+            merged['load_rolling_mean_24h'] = merged['total_load_actual'].shift(1).rolling(24).mean()
+            merged['load_rolling_std_24h']  = merged['total_load_actual'].shift(1).rolling(24).std()
+
+            merged = merged.dropna(subset=FEATURES)
+
+            if len(merged) == 0:
+                st.warning("Not enough data rows after lag feature construction. Try fetching more days.")
+                st.stop()
+
+            merged['predicted'] = rf_model.predict(merged[FEATURES])
+
+        # ── Step 4: Show results ──────────────────────────────────────────
+        st.divider()
+        st.subheader(f"📊 Results — {country} ({start_dt.date()} to {end_dt.date()})")
+
+        from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+        mae  = mean_absolute_error(merged['total_load_actual'], merged['predicted'])
+        rmse = np.sqrt(mean_squared_error(merged['total_load_actual'], merged['predicted']))
+        r2   = r2_score(merged['total_load_actual'], merged['predicted'])
+        mape = ((merged['total_load_actual'] - merged['predicted']).abs() /
+                 merged['total_load_actual']).mean() * 100
+
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("Hours",  f"{len(merged):,}")
+        c2.metric("MAE",    f"{mae:.0f} MW")
+        c3.metric("R²",     f"{r2:.4f}")
+        c4.metric("MAPE",   f"{mape:.2f}%")
+
+        st.info(f"ℹ️ Note: The model was trained on Spanish data (2015–2018). "
+                f"Performance on {country} data reflects how well Spanish demand patterns "
+                f"generalise to other European grids — a genuine out-of-sample test.")
+
+        st.divider()
+
+        # Actual vs Predicted chart
+        st.subheader("📈 Actual vs Predicted Load")
+        fig, ax = plt.subplots(figsize=(14,4))
+        ax.plot(merged['time'], merged['total_load_actual'],
+                label='Actual', color='black', linewidth=1.2)
+        ax.plot(merged['time'], merged['predicted'],
+                label=f'Predicted (R²={r2:.4f})', color='steelblue',
+                linewidth=1.2, alpha=0.85)
+        ax.fill_between(merged['time'],
+                        merged['predicted']-mae, merged['predicted']+mae,
+                        alpha=0.15, color='steelblue', label=f'±MAE ({mae:.0f} MW)')
+        ax.set_xlabel('Date'); ax.set_ylabel('Load (MW)')
+        ax.set_title(f'{country} — Actual vs Predicted Load', fontsize=13)
+        ax.legend(fontsize=9)
+        ax.xaxis.set_major_formatter(mdates.DateFormatter('%d %b'))
+        ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
+        plt.xticks(rotation=30); plt.tight_layout()
+        st.pyplot(fig); plt.close()
+
+        # Download
+        st.divider()
+        dl = merged[['time','total_load_actual','predicted']].copy()
+        dl.columns = ['Datetime','Actual Load (MW)','Predicted Load (MW)']
+        st.download_button("📥 Download Predictions as CSV",
+                           dl.to_csv(index=False),
+                           file_name=f"{country.lower()}_predictions.csv",
+                           mime="text/csv",
+                           use_container_width=True)
