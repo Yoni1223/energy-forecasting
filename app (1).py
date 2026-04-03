@@ -99,7 +99,31 @@ def load_model_and_data():
             results[name] = {'MAE': round(mae,1), 'RMSE': round(rmse,1),
                              'R²': round(r2,4),   'MAPE (%)': round(mape,2)}
 
-        return models['Random Forest'], pd.DataFrame(results).T, FEATURES, df
+
+        # ── Quantile offsets from bootstrap residuals ────────────────────────
+        train_preds = models['Random Forest'].predict(X_train)
+        resids      = y_train.values - train_preds
+        quantile_offsets = {
+            'q10': float(np.percentile(resids, 10)),
+            'q90': float(np.percentile(resids, 90))
+        }
+
+        # ── Fallback model (warm-up mode — no lag features) ──────────────────
+        from sklearn.ensemble import RandomForestRegressor as _RFR
+        FEATURES_FALLBACK = [
+            'hour_sin','hour_cos','month_sin','month_cos','dow_sin','dow_cos',
+            'is_weekend','temp_c','humidity','wind_speed'
+        ]
+        fb_model = _RFR(n_estimators=100, random_state=42, n_jobs=-1)
+        fb_model.fit(X_train[FEATURES_FALLBACK], y_train)
+        fb_preds = fb_model.predict(X_test[FEATURES_FALLBACK])
+        fallback_metrics = {
+            'MAE': round(float(mean_absolute_error(y_test, fb_preds)), 1),
+            'R2':  round(float(r2_score(y_test, fb_preds)), 4)
+        }
+
+        return (models['Random Forest'], pd.DataFrame(results).T, FEATURES, df,
+                quantile_offsets, fb_model, FEATURES_FALLBACK, fallback_metrics)
 
 def _add_features(df):
     df['hour']      = df['time'].dt.hour
@@ -120,7 +144,7 @@ def _add_features(df):
         df['load_rolling_std_24h']  = df['total_load_actual'].shift(1).rolling(24).std()
     return df
 
-rf_model, results_df, FEATURES, full_df = load_model_and_data()
+rf_model, results_df, FEATURES, full_df, quantile_offsets, fb_model, FEATURES_FALLBACK, fallback_metrics = load_model_and_data()
 
 # ── Single prediction helper ───────────────────────────────────────────────────
 def build_single(dt, temp_c, humidity, wind_speed,
@@ -241,7 +265,8 @@ with st.sidebar:
         "📤 Upload Your Own Data",
         "🌍 Live European Grid",
         "📊 Model Dashboard",
-        "📈 Results & Charts"
+        "📈 Results & Charts",
+        "🔬 Uncertainty & Warm-up"
     ], label_visibility="collapsed")
     st.divider()
     st.markdown("""
@@ -309,7 +334,15 @@ if page == "🔮 Single Hour Prediction":
         c2.metric("vs Mean Demand", f"{pred-mean_d:+,.0f} MW")
         c3.metric("vs 1h Ago",      f"{pred-lag_1h:+,.0f} MW")
         c4.metric("Model R²",       "0.9823")
-        st.caption("ℹ️ Model MAE = 379 MW — actual demand is typically within ±379 MW of this prediction.")
+        pred_lo = pred + quantile_offsets['q10']
+        pred_hi = pred + quantile_offsets['q90']
+        st.divider()
+        st.subheader("📊 80% Prediction Interval")
+        ui1, ui2, ui3 = st.columns(3)
+        ui1.metric("Lower bound (P10)", f"{pred_lo:,.0f} MW")
+        ui2.metric("Central estimate",  f"{pred:,.0f} MW")
+        ui3.metric("Upper bound (P90)", f"{pred_hi:,.0f} MW")
+        st.caption(f"80% interval: {pred_lo:,.0f}–{pred_hi:,.0f} MW  |  Model MAE = 379 MW")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # PAGE 2 — DATE RANGE FORECAST
@@ -760,7 +793,27 @@ elif page == "🌍 Live European Grid":
                 st.warning("Not enough data rows after lag feature construction. Try fetching more days.")
                 st.stop()
 
-            merged['predicted'] = rf_model.predict(merged[FEATURES])
+
+            # ── Cold-start / warm-up buffer detection ─────────────────────
+            WARMUP_HOURS = 168
+            if len(merged) < WARMUP_HOURS:
+                st.warning(
+                    f"⚠️ **Warm-up mode**: Only {len(merged)} hours of data available "
+                    f"(need {WARMUP_HOURS} for lag features). Using fallback model "
+                    f"(weather + temporal features only). "
+                    f"Expected MAE ≈ {fallback_metrics['MAE']:,.0f} MW vs normal 379 MW."
+                )
+                merged = merged.dropna(subset=FEATURES_FALLBACK)
+                merged['predicted'] = fb_model.predict(merged[FEATURES_FALLBACK])
+                mode_label = "⚠️ Warm-up Mode"
+            else:
+                merged = merged.dropna(subset=FEATURES)
+                merged['predicted'] = rf_model.predict(merged[FEATURES])
+                mode_label = "✅ Full Mode"
+
+            merged['pred_lo'] = merged['predicted'] + quantile_offsets['q10']
+            merged['pred_hi'] = merged['predicted'] + quantile_offsets['q90']
+            st.info(f"🔧 Prediction mode: {mode_label}")
 
         # ── Step 4: Show results ──────────────────────────────────────────
         st.divider()
@@ -793,6 +846,9 @@ elif page == "🌍 Live European Grid":
         ax.plot(merged['time'], merged['predicted'],
                 label=f'Predicted (R²={r2:.4f})', color='steelblue',
                 linewidth=1.2, alpha=0.85)
+        if 'pred_lo' in merged.columns:
+            ax.fill_between(merged['time'], merged['pred_lo'], merged['pred_hi'],
+                            alpha=0.2, color='orange', label='80% prediction interval')
         ax.fill_between(merged['time'],
                         merged['predicted']-mae, merged['predicted']+mae,
                         alpha=0.15, color='steelblue', label=f'±MAE ({mae:.0f} MW)')
@@ -813,3 +869,122 @@ elif page == "🌍 Live European Grid":
                            file_name=f"{country.lower()}_predictions.csv",
                            mime="text/csv",
                            use_container_width=True)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 7 — UNCERTAINTY & WARM-UP BUFFER
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "🔬 Uncertainty & Warm-up":
+    st.title("🔬 Uncertainty Quantification & Warm-up Buffer Analysis")
+    st.markdown(
+        "This page documents two critical operational constraints: prediction uncertainty "
+        "and the cold-start (warm-up) problem when insufficient load history is available."
+    )
+    st.divider()
+
+    # ── Part 1: Uncertainty ───────────────────────────────────────────────────
+    st.subheader("📊 Part 1: Prediction Intervals (Bootstrap Residual Method)")
+    st.markdown("""
+    The Random Forest produces point estimates only. Prediction intervals are derived from
+    the empirical residual distribution on the training set.
+    For each prediction ŷ, the 10th and 90th percentile residuals define an 80% interval.
+    """)
+
+    q10 = quantile_offsets['q10']
+    q90 = quantile_offsets['q90']
+    interval_width = q90 - q10
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("P10 residual offset", f"{q10:+,.0f} MW")
+    c2.metric("P90 residual offset", f"{q90:+,.0f} MW")
+    c3.metric("80% interval width",  f"{interval_width:,.0f} MW")
+
+    st.info(
+        f"For any prediction ŷ, the 80% interval is [ŷ{q10:+,.0f}, ŷ{q90:+,.0f}] MW — "
+        f"a width of {interval_width:,.0f} MW."
+    )
+
+    # Plot on test sample
+    st.subheader("📈 Intervals on Test Set Sample (first 200 hours)")
+    df_full = full_df.dropna(subset=FEATURES)
+    split   = int(len(df_full) * 0.8)
+    test_s  = df_full.iloc[split:split+200].copy()
+    test_s['predicted'] = rf_model.predict(test_s[FEATURES])
+    test_s['pred_lo']   = test_s['predicted'] + q10
+    test_s['pred_hi']   = test_s['predicted'] + q90
+
+    fig, ax = plt.subplots(figsize=(14, 4))
+    ax.plot(test_s['time'].values, test_s['total_load_actual'].values,
+            label='Actual', color='black', linewidth=1.2, zorder=3)
+    ax.plot(test_s['time'].values, test_s['predicted'].values,
+            label='Point estimate (RF)', color='steelblue', linewidth=1.2, zorder=2)
+    ax.fill_between(test_s['time'].values, test_s['pred_lo'].values, test_s['pred_hi'].values,
+                    alpha=0.25, color='orange', label='80% prediction interval', zorder=1)
+    ax.set_xlabel('Date'); ax.set_ylabel('Load (MW)')
+    ax.set_title('Random Forest — Point Estimates with 80% Prediction Intervals', fontsize=13)
+    ax.legend(fontsize=9)
+    ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
+    plt.xticks(rotation=30); plt.tight_layout()
+    st.pyplot(fig); plt.close()
+
+    n_covered = ((test_s['total_load_actual'] >= test_s['pred_lo']) &
+                 (test_s['total_load_actual'] <= test_s['pred_hi'])).sum()
+    coverage = n_covered / len(test_s) * 100
+    st.metric("Empirical coverage (target: 80%)", f"{coverage:.1f}%")
+
+    st.divider()
+
+    # ── Part 2: Warm-up ───────────────────────────────────────────────────────
+    st.subheader("⏱️ Part 2: Warm-up Buffer — Cold-Start Performance")
+    st.markdown("""
+    The model requires **168 hours (7 days)** of load history for lag features.
+    Below compares full model vs fallback (weather + temporal only).
+    """)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("### ✅ Full Mode (≥168h history)")
+        st.metric("R²",   "0.9823")
+        st.metric("MAE",  "379 MW")
+        st.caption("15 features: lags, rolling stats, weather, temporal")
+    with c2:
+        st.markdown("### ⚠️ Warm-up Mode (<168h history)")
+        st.metric("R²",   str(fallback_metrics['R2']))
+        st.metric("MAE",  f"{fallback_metrics['MAE']:,.0f} MW",
+                  delta=f"+{fallback_metrics['MAE']-379:.0f} MW vs full")
+        st.caption("10 features: weather + temporal only (no lags)")
+
+    st.warning(
+        f"Without lag features, MAE rises from 379 MW to {fallback_metrics['MAE']:,.0f} MW "
+        f"({(fallback_metrics['MAE']-379)/379*100:.0f}% degradation). "
+        f"A minimum 7-day warm-up buffer is a hard operational requirement."
+    )
+
+    fig2, axes = plt.subplots(1, 2, figsize=(10, 3))
+    for ax, metric, fv, wv in zip(axes,
+        ['R²', 'MAE (MW)'],
+        [0.9823, 379],
+        [fallback_metrics['R2'], fallback_metrics['MAE']]):
+        bars = ax.bar(['Full Mode', 'Warm-up Mode'], [fv, wv],
+                      color=['#59a14f','#e07b54'], width=0.4)
+        ax.set_title(metric, fontweight='bold')
+        for bar, val in zip(bars, [fv, wv]):
+            ax.text(bar.get_x()+bar.get_width()/2, bar.get_height()*1.02,
+                    f'{val}', ha='center', fontweight='bold')
+        ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
+    plt.tight_layout()
+    st.pyplot(fig2); plt.close()
+
+    st.subheader("🔧 Cold-Start Detection Code")
+    st.code("""
+WARMUP_HOURS = 168  # 7-day minimum for lag_168h
+
+if len(available_history) < WARMUP_HOURS:
+    # Fallback: weather + temporal features only
+    predictions = fallback_model.predict(X[FEATURES_FALLBACK])
+    expected_mae = {warmup_mae} MW
+else:
+    # Full model: all 15 features including lags
+    predictions = rf_model.predict(X[FEATURES])
+    expected_mae = 379 MW
+    """.format(warmup_mae=int(fallback_metrics['MAE'])), language='python')
